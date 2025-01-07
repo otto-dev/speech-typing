@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+
+import sys
+import queue
+import threading
+import time
+import subprocess
+
+# --- Keyboard-related imports ---
+from evdev import InputDevice, categorize, ecodes, list_devices
+from pynput.keyboard import Controller as KeyboardController, Key
+
+# --- Audio/transcription-related imports ---
+import sounddevice as sd
+import numpy as np
+from faster_whisper import WhisperModel
+
+################################################################################
+# 1) Keyboard Device Detection
+################################################################################
+
+def find_keyboard_device():
+    """
+    Tries to find an event device that looks like a keyboard.
+    In practice, you might have to hardcode the event number
+    or select from a list if multiple keyboards exist.
+    """
+    from evdev import list_devices
+    for dev_path in list_devices():
+        device = InputDevice(dev_path)
+        capabilities = device.capabilities(verbose=True)
+        # We're looking for a device that has EV_KEY in its capabilities
+        # and name = 'USB-HID Keyboard' (adjust if your device name differs).
+        if ('EV_KEY', 1) in capabilities and device.name == 'USB-HID Keyboard':
+            return dev_path
+    return None
+
+################################################################################
+# 2) Global variables and flags
+################################################################################
+
+is_recording = False         # Indicates if we're currently recording
+stop_recording_flag = False  # Signals the recording thread to stop
+audio_queue = queue.Queue()  # Thread-safe queue to store recorded chunks
+record_thread = None         # Reference to the recording thread
+
+# Track Ctrl keys for normal start/stop toggling
+left_ctrl_pressed = False
+right_ctrl_pressed = False
+
+# Track Shift keys for aborting ongoing recording
+left_shift_pressed = False
+right_shift_pressed = False
+
+# We'll create a single Whisper model once, so we don't re-load it every time.
+# Adjust model path, device, etc., as needed.
+whisper_model = WhisperModel("large-v2", device="cuda", compute_type="default")
+
+# For simulating keystrokes
+keyboard_simulator = KeyboardController()
+
+################################################################################
+# 3) Bluetooth Helper Functions
+################################################################################
+
+def run_cmd_as_user(cmd):
+    """
+    Runs the specified command as the user with UID 1000 (instead of root).
+    """
+    return subprocess.run(["sudo", "-Eu", "#1000"] + cmd, 
+                          capture_output=True, text=True, check=False)
+
+def get_bluetooth_cards():
+    """
+    Returns a list of pactl card identifiers for all Bluetooth cards (i.e., those
+    whose name contains 'bluez').
+    """
+    result = run_cmd_as_user(["pactl", "list", "cards", "short"])
+    if result.returncode != 0:
+        print(f"[Error] Failed to list cards: {result.stderr}")
+        return []
+    lines = result.stdout.strip().split("\n")
+    bt_cards = []
+    for line in lines:
+        # Format is: <index>\t<name>\t<driver>
+        parts = line.split()
+        if len(parts) >= 2:
+            card_index = parts[0]
+            card_name = parts[1]
+            # If 'bluez' is in the card name, it's a Bluetooth device
+            if "bluez" in card_name:
+                # We can set the card by index or by name.
+                # Here, we'll just store the card_index for convenience.
+                bt_cards.append(card_index)
+    return bt_cards
+
+def switch_bluetooth_profile(profile):
+    """
+    Switches all detected Bluetooth cards (bluez) to the specified profile.
+    Profile can be:
+      - "headset-head-unit"
+      - "a2dp-sink"
+    """
+    cards = get_bluetooth_cards()
+    for card in cards:
+        cmd = ["pactl", "set-card-profile", card, profile]
+        print(f"[Bluetooth] Switching card {card} to profile '{profile}'")
+        result = run_cmd_as_user(cmd)
+        if result.returncode != 0:
+            print(f"[Bluetooth] Error setting profile on card {card}: {result.stderr}")
+
+################################################################################
+# 4) Audio Recording Thread
+################################################################################
+
+def audio_recording_thread(sample_rate=16000):
+    """
+    Runs in a separate thread; reads the microphone input and stores data in 'audio_queue'.
+    Stops when 'stop_recording_flag' is set to True.
+    """
+    global stop_recording_flag
+
+    def callback(indata, frames, time_info, status):
+        if status:
+            print(f"SoundDevice status: {status}", file=sys.stderr)
+        audio_queue.put(indata.copy())  # Add a copy of the audio chunk to the queue
+
+    with sd.InputStream(samplerate=sample_rate, channels=1, dtype='int16',
+                        callback=callback, blocksize=1024):
+        print("[Recording thread] Started recording.")
+        while True:
+            if stop_recording_flag:
+                print("[Recording thread] Stop flag received.")
+                break
+            time.sleep(0.01)
+
+    print("[Recording thread] Exiting.")
+
+################################################################################
+# 5) Start/Stop Recording Helpers
+################################################################################
+
+def start_recording():
+    """Initialize audio queue, switch BT headsets to HSP, start the recording thread."""
+    global is_recording, stop_recording_flag, record_thread, audio_queue
+
+    if is_recording:
+        print("[Main] Already recording.")
+        return
+
+    # 1. Switch all Bluetooth headsets to HSP (headset-head-unit)
+    print("[Main] Switching all Bluetooth headsets to HSP/HFP before recording...")
+    switch_bluetooth_profile("headset-head-unit")
+
+    # 2. Start recording
+    print("[Main] Starting recording...")
+    is_recording = True
+    stop_recording_flag = False
+    audio_queue = queue.Queue()
+    record_thread = threading.Thread(target=audio_recording_thread, args=(16000,))
+    record_thread.daemon = True
+    record_thread.start()
+
+def stop_recording_and_transcribe():
+    """
+    Signal the recording thread to stop, collect audio, run transcription,
+    type out the result, then switch BT headsets back to A2DP.
+    """
+    global is_recording, stop_recording_flag, record_thread
+
+    if not is_recording:
+        print("[Main] Not currently recording.")
+        return
+
+    print("[Main] Stopping recording...")
+    is_recording = False
+    stop_recording_flag = True
+    if record_thread is not None:
+        record_thread.join()
+
+    # Collect all audio from the queue
+    print("[Main] Collecting audio data...")
+    recorded_chunks = []
+    while not audio_queue.empty():
+        recorded_chunks.append(audio_queue.get())
+
+    if not recorded_chunks:
+        print("[Main] No audio recorded.")
+        # Always attempt to switch back to A2DP afterwards
+        switch_bluetooth_profile("a2dp-sink")
+        return
+
+    # Concatenate all chunks into one numpy array
+    audio_data = np.concatenate(recorded_chunks, axis=0).flatten()
+
+    # Switch all Bluetooth headsets back to A2DP
+    print("[Main] Switching all Bluetooth headsets back to A2DP after recording...")
+    switch_bluetooth_profile("a2dp-sink")
+    
+    # Transcribe
+    print("[Main] Transcribing audio...")
+    text_result = transcribe_audio(audio_data, sample_rate=16000)
+    print(f"[Main] Transcription result: {text_result!r}")
+
+    # Type the result
+    simulate_typing(text_result)
+
+def abort_recording():
+    """
+    Abort any ongoing recording without transcription.
+    This stops the recording thread, discards the recorded audio,
+    and resets the audio devices back to A2DP.
+    """
+    global is_recording, stop_recording_flag, record_thread, audio_queue
+
+    if not is_recording:
+        # Nothing to abort if we're not currently recording
+        return
+
+    print("[Main] Aborting recording (no transcription).")
+    is_recording = False
+    stop_recording_flag = True
+
+    if record_thread is not None:
+        record_thread.join()
+
+    # Discard any recorded audio
+    print("[Main] Discarding recorded audio data...")
+    while not audio_queue.empty():
+        audio_queue.get()
+
+    # Reset the audio devices back to A2DP
+    print("[Main] Switching all Bluetooth headsets back to A2DP after abort...")
+    switch_bluetooth_profile("a2dp-sink")
+
+def transcribe_audio(audio_data, sample_rate=16000):
+    """
+    Transcribe an int16 numpy array using faster_whisper.
+    Returns the resulting text string.
+    """
+    # Convert to float32 for the model
+    audio_data_float32 = audio_data.astype(np.float32) / 32768.0
+    segments, _info = whisper_model.transcribe(audio=audio_data_float32, language=None)
+
+    # Combine all segments text
+    transcription = "".join(segment.text for segment in segments).strip()
+    return transcription
+
+################################################################################
+# 6) Typing with Capitalization Preserved
+################################################################################
+
+def simulate_typing(text):
+    """
+    Simulate typing of the transcribed text using pynput,
+    preserving capitalization by pressing Shift for uppercase letters.
+    """
+    for ch in text:
+        # If it's an uppercase letter, press Shift + the lowercase letter
+        if ch.isalpha() and ch.isupper():
+            with keyboard_simulator.pressed(Key.shift):
+                keyboard_simulator.press(ch.lower())
+                keyboard_simulator.release(ch.lower())
+        else:
+            # Type the character directly
+            keyboard_simulator.press(ch)
+            keyboard_simulator.release(ch)
+        # Optional small delay between keystrokes
+        # time.sleep(0.005)
+
+################################################################################
+# 7) Keyboard Event Loop
+################################################################################
+
+def keyboard_listener_loop(dev_path):
+    """
+    Reads events from the keyboard device and:
+      - Toggles start/stop recording when Left Ctrl + Right Ctrl are pressed.
+      - Aborts any ongoing recording when Left Shift + Right Shift are pressed.
+    """
+    global left_ctrl_pressed, right_ctrl_pressed
+    global left_shift_pressed, right_shift_pressed
+
+    dev = InputDevice(dev_path)
+    print(f"[Main] Listening on keyboard device: {dev_path}")
+
+    print("[Main] Press Left Ctrl + Right Ctrl together to start/stop recording.")
+    print("[Main] Press Left Shift + Right Shift together to ABORT any recording.")
+
+    try:
+        for event in dev.read_loop():
+            if event.type == ecodes.EV_KEY:
+                key_event = categorize(event)
+
+                # Handle Ctrl keys
+                if key_event.keycode == "KEY_LEFTCTRL":
+                    if key_event.keystate == key_event.key_down:
+                        left_ctrl_pressed = True
+                    elif key_event.keystate == key_event.key_up:
+                        left_ctrl_pressed = False
+
+                if key_event.keycode == "KEY_RIGHTCTRL":
+                    if key_event.keystate == key_event.key_down:
+                        right_ctrl_pressed = True
+                    elif key_event.keystate == key_event.key_up:
+                        right_ctrl_pressed = False
+
+                # Handle Shift keys
+                if key_event.keycode == "KEY_LEFTSHIFT":
+                    if key_event.keystate == key_event.key_down:
+                        left_shift_pressed = True
+                    elif key_event.keystate == key_event.key_up:
+                        left_shift_pressed = False
+
+                if key_event.keycode == "KEY_RIGHTSHIFT":
+                    if key_event.keystate == key_event.key_down:
+                        right_shift_pressed = True
+                    elif key_event.keystate == key_event.key_up:
+                        right_shift_pressed = False
+
+                # Check for simultaneous Ctrl presses -> toggle recording
+                if left_ctrl_pressed and right_ctrl_pressed and key_event.keystate == key_event.key_down:
+                    if not is_recording:
+                        start_recording()
+                    else:
+                        stop_recording_and_transcribe()
+
+                # Check for simultaneous Shift presses -> abort recording
+                if left_shift_pressed and right_shift_pressed and key_event.keystate == key_event.key_down:
+                    abort_recording()
+
+    except KeyboardInterrupt:
+        print("[Main] KeyboardInterrupt received. Exiting.")
+    finally:
+        # If still recording upon exit, stop gracefully (with transcription or abort).
+        if is_recording:
+            stop_recording_and_transcribe()
+        print("[Main] Bye!")
+
+################################################################################
+# 8) Main Entry Point
+################################################################################
+
+def main():
+    dev_path = find_keyboard_device()  # adjust if your device name is different
+    if not dev_path:
+        print("Could not find a keyboard-like device. Exiting.", file=sys.stderr)
+        sys.exit(1)
+
+    keyboard_listener_loop(dev_path)
+
+if __name__ == "__main__":
+    main()
