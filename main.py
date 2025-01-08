@@ -53,8 +53,8 @@ left_shift_pressed = False
 right_shift_pressed = False
 
 # We'll create a single Whisper model once, so we don't re-load it every time.
-# Adjust model path, device, etc., as needed.
-whisper_model = WhisperModel("large-v2", device="cuda", compute_type="default")
+#  tiny.en, tiny, base.en, base, small.en, small, medium.en, medium, large-v1, large-v2, large-v3, large, distil-large-v2, distil-medium.en, distil-small.en, distil-large-v3, large-v3-turbo, turbo
+whisper_model = WhisperModel("large-v3-turbo", device="cuda", compute_type="default")
 
 # For simulating keystrokes
 keyboard_simulator = KeyboardController()
@@ -240,7 +240,7 @@ def transcribe_audio(audio_data, sample_rate=16000):
     """
     # Convert to float32 for the model
     audio_data_float32 = audio_data.astype(np.float32) / 32768.0
-    segments, _info = whisper_model.transcribe(audio=audio_data_float32, language=None)
+    segments, _info = whisper_model.transcribe(audio=audio_data_float32, language="en", word_timestamps=False, beam_size=5,)
 
     # Combine all segments text
     transcription = "".join(segment.text for segment in segments).strip()
@@ -253,20 +253,55 @@ def transcribe_audio(audio_data, sample_rate=16000):
 def simulate_typing(text):
     """
     Simulate typing of the transcribed text using pynput,
-    preserving capitalization by pressing Shift for uppercase letters.
+    preserving capitalization by pressing Shift for uppercase letters
+    and for punctuation that requires Shift.
     """
+    SHIFT_REQUIRED = {
+        '?': '/',
+        ':': ';',
+        '"': "'",
+        '<': ',',
+        '>': '.',
+        '{': '[',
+        '}': ']',
+        '|': '\\',
+        '~': '`',
+        '!': '1',
+        '@': '2',
+        '#': '3',
+        '$': '4',
+        '%': '5',
+        '^': '6',
+        '&': '7',
+        '*': '8',
+        '(': '9',
+        ')': '0',
+        '_': '-',
+        '+': '='
+    }
+
     for ch in text:
-        # If it's an uppercase letter, press Shift + the lowercase letter
-        if ch.isalpha() and ch.isupper():
+        # 1) Handle punctuation/symbols that need Shift
+        if ch in SHIFT_REQUIRED:
+            with keyboard_simulator.pressed(Key.shift):
+                key_to_press = SHIFT_REQUIRED[ch]
+                keyboard_simulator.press(key_to_press)
+                keyboard_simulator.release(key_to_press)
+
+        # 2) Handle uppercase letters
+        elif ch.isalpha() and ch.isupper():
             with keyboard_simulator.pressed(Key.shift):
                 keyboard_simulator.press(ch.lower())
                 keyboard_simulator.release(ch.lower())
+
+        # 3) Type everything else “as is”
         else:
-            # Type the character directly
             keyboard_simulator.press(ch)
             keyboard_simulator.release(ch)
-        # Optional small delay between keystrokes
-        # time.sleep(0.005)
+        
+        # Optional short delay:
+        # time.sleep(0.01)
+
 
 ################################################################################
 # 7) Keyboard Event Loop
