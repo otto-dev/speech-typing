@@ -28,8 +28,7 @@ def find_keyboard_device():
     for dev_path in list_devices():
         device = InputDevice(dev_path)
         capabilities = device.capabilities(verbose=True)
-        # We're looking for a device that has EV_KEY in its capabilities
-        # and name = 'USB-HID Keyboard' (adjust if your device name differs).
+        # Adjust the device.name check if your keyboard has a different name.
         if ('EV_KEY', 1) in capabilities and device.name == 'USB-HID Keyboard':
             return dev_path
     return None
@@ -52,7 +51,6 @@ left_shift_pressed = False
 right_shift_pressed = False
 
 # We'll create a single Whisper model once, so we don't re-load it every time.
-#  tiny.en, tiny, base.en, base, small.en, small, medium.en, medium, large-v1, large-v2, large-v3, large, distil-large-v2, distil-medium.en, distil-small.en, distil-large-v3, large-v3-turbo, turbo
 whisper_model = WhisperModel("large-v3-turbo", device="cuda", compute_type="default")
 
 # For simulating keystrokes
@@ -171,7 +169,6 @@ def transcribe_audio(audio_data, sample_rate=16000):
     Transcribe an int16 numpy array using faster_whisper.
     Returns the resulting text string.
     """
-    # Convert to float32 for the model
     audio_data_float32 = audio_data.astype(np.float32) / 32768.0
     segments, _info = whisper_model.transcribe(
         audio=audio_data_float32,
@@ -179,8 +176,6 @@ def transcribe_audio(audio_data, sample_rate=16000):
         word_timestamps=False,
         beam_size=5,
     )
-
-    # Combine all segments text
     transcription = "".join(segment.text for segment in segments).strip()
     return transcription
 
@@ -232,16 +227,13 @@ def simulate_typing(text):
                 keyboard_simulator.press(ch.lower())
                 keyboard_simulator.release(ch.lower())
 
-        # 3) Type everything else “as is”
+        # 3) Type everything else as-is
         else:
             keyboard_simulator.press(ch)
             keyboard_simulator.release(ch)
-        
-        # Optional short delay:
-        # time.sleep(0.01)
 
 ################################################################################
-# 6) Keyboard Event Loop
+# 6) Keyboard Event Loop with Graceful Error Handling (No extra Ctrl+Ctrl needed)
 ################################################################################
 
 def keyboard_listener_loop(dev_path):
@@ -249,12 +241,14 @@ def keyboard_listener_loop(dev_path):
     Reads events from the keyboard device and:
       - Toggles start/stop recording when Left Ctrl + Right Ctrl are pressed.
       - Aborts any ongoing recording when Left Shift + Right Shift are pressed.
+      - If OSError: [Errno 19] No such device, go into inactive mode and wait for
+        a new keyboard. Once found, automatically resume listening on that new device.
     """
     global left_ctrl_pressed, right_ctrl_pressed
     global left_shift_pressed, right_shift_pressed
 
-    dev = InputDevice(dev_path)
     print(f"[Main] Listening on keyboard device: {dev_path}")
+    dev = InputDevice(dev_path)
 
     print("[Main] Press Left Ctrl + Right Ctrl together to start/stop recording.")
     print("[Main] Press Left Shift + Right Shift together to ABORT any recording.")
@@ -301,10 +295,27 @@ def keyboard_listener_loop(dev_path):
                 if left_shift_pressed and right_shift_pressed and key_event.keystate == key_event.key_down:
                     abort_recording()
 
+    except OSError as e:
+        # Gracefully handle "No such device"
+        if e.errno == 19:
+            print("[Main] Device not found or disconnected. Inactive mode.")
+            print("[Main] Will automatically resume when a new keyboard is found.")
+            # Inactive mode: poll for a newly detected keyboard
+            while True:
+                time.sleep(1)
+                possible_new_device = find_keyboard_device()
+                if possible_new_device:
+                    print("[Main] Found a new keyboard. Resuming operation.")
+                    keyboard_listener_loop(possible_new_device)
+                    return  # Important to exit the old function scope
+        else:
+            # If it's some other OSError, re-raise
+            raise
+
     except KeyboardInterrupt:
         print("[Main] KeyboardInterrupt received. Exiting.")
     finally:
-        # If still recording upon exit, stop gracefully (with transcription or abort).
+        # If still recording upon exit, stop gracefully (with transcription).
         if is_recording:
             stop_recording_and_transcribe()
         print("[Main] Bye!")
@@ -314,12 +325,20 @@ def keyboard_listener_loop(dev_path):
 ################################################################################
 
 def main():
-    dev_path = find_keyboard_device()  # adjust if your device name is different
+    dev_path = find_keyboard_device()
     if not dev_path:
-        print("Could not find a keyboard-like device. Exiting.", file=sys.stderr)
-        sys.exit(1)
-
-    keyboard_listener_loop(dev_path)
+        print("Could not find a keyboard-like device initially. Inactive mode.")
+        print("Reconnect your keyboard at any time; script will automatically resume.")
+        # Poll for a keyboard device
+        while True:
+            time.sleep(1)
+            possible_new_device = find_keyboard_device()
+            if possible_new_device:
+                print("[Main] Found a device. Now listening.")
+                keyboard_listener_loop(possible_new_device)
+                break
+    else:
+        keyboard_listener_loop(dev_path)
 
 if __name__ == "__main__":
     main()
