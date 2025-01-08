@@ -4,6 +4,8 @@ import sys
 import queue
 import threading
 import time
+import subprocess
+import tkinter as tk
 
 # --- Keyboard-related imports ---
 from evdev import InputDevice, categorize, ecodes, list_devices
@@ -15,6 +17,114 @@ import numpy as np
 from faster_whisper import WhisperModel
 
 ################################################################################
+# 0) Activity Indicator Overlay using Tkinter
+################################################################################
+
+def get_primary_display_geometry():
+    """
+    Use xrandr to find the geometry (x, y, width, height) of the primary display.
+    Returns (disp_x, disp_y, disp_width, disp_height).
+
+    If it can't detect the primary display for any reason, returns None.
+    """
+    try:
+        result = subprocess.run(
+            ["xrandr", "--query"], capture_output=True, text=True, check=True
+        ).stdout
+
+        # Look for a line containing " primary "
+        for line in result.splitlines():
+            if " primary " in line:
+                # Typical line example: "DP-1 connected primary 1920x1080+0+0 ..."
+                parts = line.split()
+                # Find the part that looks like 1920x1080+0+0
+                for part in parts:
+                    if "+" in part and "x" in part:
+                        geometry = part
+                        break
+                else:
+                    continue
+
+                # Parse the geometry "1920x1080+0+0"
+                res, x_off, y_off = geometry.split("+")
+                width, height = res.split("x")
+                disp_width = int(width)
+                disp_height = int(height)
+                disp_x = int(x_off)
+                disp_y = int(y_off)
+
+                return (disp_x, disp_y, disp_width, disp_height)
+        return None
+    except Exception:
+        return None
+
+# We'll create a global Tk root for our overlay:
+root = None
+listening_label = None
+
+def init_overlay():
+    """
+    Initializes the Tkinter overlay (but does not show it by default).
+    """
+    global root, listening_label
+
+    root = tk.Tk()
+    root.overrideredirect(True)       # Remove window decorations
+    root.attributes("-topmost", True) # Keep on top
+
+
+    # Dimensions of our overlay
+    overlay_width = 150
+    overlay_height = 50
+
+    # Margin from the bottom and left edges
+    margin = 40
+
+    # Detect the geometry of the primary display, if available
+    primary_geometry = get_primary_display_geometry()
+    if primary_geometry is not None:
+        disp_x, disp_y, disp_width, disp_height = primary_geometry
+        # Bottom-left corner, with a margin
+        x_pos = disp_x + margin
+        y_pos = disp_y + disp_height - overlay_height - margin
+    else:
+        # Fallback: use total screen width/height from Tkinter
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        x_pos = margin
+        y_pos = screen_height - overlay_height - margin
+
+    # Set geometry
+    root.geometry(f"{overlay_width}x{overlay_height}+{x_pos}+{y_pos}")
+
+    # Create the label
+    listening_label = tk.Label(
+        root,
+        text="Listening...",
+        fg="white",
+        bg="green",
+        font=("Helvetica", 12, "bold")
+    )
+    listening_label.pack(expand=True, fill="both")
+
+    # Hide by default
+    root.withdraw()
+
+def show_overlay():
+    """
+    Makes the overlay visible.
+    """
+    if root is not None:
+        root.deiconify()
+
+def hide_overlay():
+    """
+    Hides the overlay.
+    """
+    if root is not None:
+        root.withdraw()
+
+################################################################################
 # 1) Keyboard Device Detection
 ################################################################################
 
@@ -24,7 +134,6 @@ def find_keyboard_device():
     In practice, you might have to hardcode the event number
     or select from a list if multiple keyboards exist.
     """
-    from evdev import list_devices
     for dev_path in list_devices():
         device = InputDevice(dev_path)
         capabilities = device.capabilities(verbose=True)
@@ -99,6 +208,10 @@ def start_recording():
     is_recording = True
     stop_recording_flag = False
     audio_queue = queue.Queue()
+
+    # Show "listening..." overlay
+    show_overlay()
+
     record_thread = threading.Thread(target=audio_recording_thread, args=(16000,))
     record_thread.daemon = True
     record_thread.start()
@@ -119,6 +232,9 @@ def stop_recording_and_transcribe():
     stop_recording_flag = True
     if record_thread is not None:
         record_thread.join()
+
+    # Hide "listening..." overlay
+    hide_overlay()
 
     # Collect all audio from the queue
     print("[Main] Collecting audio data...")
@@ -158,6 +274,9 @@ def abort_recording():
 
     if record_thread is not None:
         record_thread.join()
+
+    # Hide "listening..." overlay
+    hide_overlay()
 
     # Discard any recorded audio
     print("[Main] Discarding recorded audio data...")
@@ -233,7 +352,7 @@ def simulate_typing(text):
             keyboard_simulator.release(ch)
 
 ################################################################################
-# 6) Keyboard Event Loop with Graceful Error Handling (No extra Ctrl+Ctrl needed)
+# 6) Keyboard Event Loop
 ################################################################################
 
 def keyboard_listener_loop(dev_path):
@@ -324,21 +443,40 @@ def keyboard_listener_loop(dev_path):
 # 7) Main Entry Point
 ################################################################################
 
+def start_keyboard_thread():
+    """
+    Finds a keyboard device (or waits for one), then starts the keyboard listener loop.
+    This runs in a separate thread so the Tk mainloop remains free.
+    """
+    def _run():
+        dev_path = find_keyboard_device()
+        if not dev_path:
+            print("Could not find a keyboard-like device initially. Inactive mode.")
+            print("Reconnect your keyboard at any time; script will automatically resume.")
+            # Poll for a keyboard device
+            while True:
+                time.sleep(1)
+                possible_new_device = find_keyboard_device()
+                if possible_new_device:
+                    print("[Main] Found a device. Now listening.")
+                    keyboard_listener_loop(possible_new_device)
+                    break
+        else:
+            keyboard_listener_loop(dev_path)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
 def main():
-    dev_path = find_keyboard_device()
-    if not dev_path:
-        print("Could not find a keyboard-like device initially. Inactive mode.")
-        print("Reconnect your keyboard at any time; script will automatically resume.")
-        # Poll for a keyboard device
-        while True:
-            time.sleep(1)
-            possible_new_device = find_keyboard_device()
-            if possible_new_device:
-                print("[Main] Found a device. Now listening.")
-                keyboard_listener_loop(possible_new_device)
-                break
-    else:
-        keyboard_listener_loop(dev_path)
+    # 1) Initialize the Tkinter overlay
+    init_overlay()
+
+    # 2) Start keyboard listener in a background thread
+    start_keyboard_thread()
+
+    # 3) Run the Tkinter main loop in the main thread (blocking)
+    print("[Main] Entering Tk mainloop. Press Ctrl+C in the terminal to quit.")
+    root.mainloop()
 
 if __name__ == "__main__":
     main()
