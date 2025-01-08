@@ -4,7 +4,6 @@ import sys
 import queue
 import threading
 import time
-import subprocess
 
 # --- Keyboard-related imports ---
 from evdev import InputDevice, categorize, ecodes, list_devices
@@ -60,57 +59,7 @@ whisper_model = WhisperModel("large-v3-turbo", device="cuda", compute_type="defa
 keyboard_simulator = KeyboardController()
 
 ################################################################################
-# 3) Bluetooth Helper Functions
-################################################################################
-
-def run_cmd_as_user(cmd):
-    """
-    Runs the specified command as the user with UID 1000 (instead of root).
-    """
-    return subprocess.run(["sudo", "-Eu", "#1000"] + cmd, 
-                          capture_output=True, text=True, check=False)
-
-def get_bluetooth_cards():
-    """
-    Returns a list of pactl card identifiers for all Bluetooth cards (i.e., those
-    whose name contains 'bluez').
-    """
-    result = run_cmd_as_user(["pactl", "list", "cards", "short"])
-    if result.returncode != 0:
-        print(f"[Error] Failed to list cards: {result.stderr}")
-        return []
-    lines = result.stdout.strip().split("\n")
-    bt_cards = []
-    for line in lines:
-        # Format is: <index>\t<name>\t<driver>
-        parts = line.split()
-        if len(parts) >= 2:
-            card_index = parts[0]
-            card_name = parts[1]
-            # If 'bluez' is in the card name, it's a Bluetooth device
-            if "bluez" in card_name:
-                # We can set the card by index or by name.
-                # Here, we'll just store the card_index for convenience.
-                bt_cards.append(card_index)
-    return bt_cards
-
-def switch_bluetooth_profile(profile):
-    """
-    Switches all detected Bluetooth cards (bluez) to the specified profile.
-    Profile can be:
-      - "headset-head-unit"
-      - "a2dp-sink"
-    """
-    cards = get_bluetooth_cards()
-    for card in cards:
-        cmd = ["pactl", "set-card-profile", card, profile]
-        print(f"[Bluetooth] Switching card {card} to profile '{profile}'")
-        result = run_cmd_as_user(cmd)
-        if result.returncode != 0:
-            print(f"[Bluetooth] Error setting profile on card {card}: {result.stderr}")
-
-################################################################################
-# 4) Audio Recording Thread
+# 3) Audio Recording Thread
 ################################################################################
 
 def audio_recording_thread(sample_rate=16000):
@@ -137,22 +86,17 @@ def audio_recording_thread(sample_rate=16000):
     print("[Recording thread] Exiting.")
 
 ################################################################################
-# 5) Start/Stop Recording Helpers
+# 4) Start/Stop Recording Helpers
 ################################################################################
 
 def start_recording():
-    """Initialize audio queue, switch BT headsets to HSP, start the recording thread."""
+    """Initialize audio queue and start the recording thread."""
     global is_recording, stop_recording_flag, record_thread, audio_queue
 
     if is_recording:
         print("[Main] Already recording.")
         return
 
-    # 1. Switch all Bluetooth headsets to HSP (headset-head-unit)
-    print("[Main] Switching all Bluetooth headsets to HSP/HFP before recording...")
-    switch_bluetooth_profile("headset-head-unit")
-
-    # 2. Start recording
     print("[Main] Starting recording...")
     is_recording = True
     stop_recording_flag = False
@@ -164,7 +108,7 @@ def start_recording():
 def stop_recording_and_transcribe():
     """
     Signal the recording thread to stop, collect audio, run transcription,
-    type out the result, then switch BT headsets back to A2DP.
+    then type out the result.
     """
     global is_recording, stop_recording_flag, record_thread
 
@@ -186,17 +130,11 @@ def stop_recording_and_transcribe():
 
     if not recorded_chunks:
         print("[Main] No audio recorded.")
-        # Always attempt to switch back to A2DP afterwards
-        switch_bluetooth_profile("a2dp-sink")
         return
 
     # Concatenate all chunks into one numpy array
     audio_data = np.concatenate(recorded_chunks, axis=0).flatten()
 
-    # Switch all Bluetooth headsets back to A2DP
-    print("[Main] Switching all Bluetooth headsets back to A2DP after recording...")
-    switch_bluetooth_profile("a2dp-sink")
-    
     # Transcribe
     print("[Main] Transcribing audio...")
     text_result = transcribe_audio(audio_data, sample_rate=16000)
@@ -208,8 +146,7 @@ def stop_recording_and_transcribe():
 def abort_recording():
     """
     Abort any ongoing recording without transcription.
-    This stops the recording thread, discards the recorded audio,
-    and resets the audio devices back to A2DP.
+    This stops the recording thread and discards the recorded audio.
     """
     global is_recording, stop_recording_flag, record_thread, audio_queue
 
@@ -229,10 +166,6 @@ def abort_recording():
     while not audio_queue.empty():
         audio_queue.get()
 
-    # Reset the audio devices back to A2DP
-    print("[Main] Switching all Bluetooth headsets back to A2DP after abort...")
-    switch_bluetooth_profile("a2dp-sink")
-
 def transcribe_audio(audio_data, sample_rate=16000):
     """
     Transcribe an int16 numpy array using faster_whisper.
@@ -240,14 +173,19 @@ def transcribe_audio(audio_data, sample_rate=16000):
     """
     # Convert to float32 for the model
     audio_data_float32 = audio_data.astype(np.float32) / 32768.0
-    segments, _info = whisper_model.transcribe(audio=audio_data_float32, language="en", word_timestamps=False, beam_size=5,)
+    segments, _info = whisper_model.transcribe(
+        audio=audio_data_float32,
+        language="en",
+        word_timestamps=False,
+        beam_size=5,
+    )
 
     # Combine all segments text
     transcription = "".join(segment.text for segment in segments).strip()
     return transcription
 
 ################################################################################
-# 6) Typing with Capitalization Preserved
+# 5) Typing with Capitalization Preserved
 ################################################################################
 
 def simulate_typing(text):
@@ -302,9 +240,8 @@ def simulate_typing(text):
         # Optional short delay:
         # time.sleep(0.01)
 
-
 ################################################################################
-# 7) Keyboard Event Loop
+# 6) Keyboard Event Loop
 ################################################################################
 
 def keyboard_listener_loop(dev_path):
@@ -373,7 +310,7 @@ def keyboard_listener_loop(dev_path):
         print("[Main] Bye!")
 
 ################################################################################
-# 8) Main Entry Point
+# 7) Main Entry Point
 ################################################################################
 
 def main():
