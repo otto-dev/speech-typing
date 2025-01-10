@@ -72,7 +72,6 @@ def init_overlay():
     root.overrideredirect(True)       # Remove window decorations
     root.attributes("-topmost", True) # Keep on top
 
-
     # Dimensions of our overlay
     overlay_width = 150
     overlay_height = 50
@@ -123,6 +122,16 @@ def hide_overlay():
     """
     if root is not None:
         root.withdraw()
+
+def set_overlay_text(new_text, bg_color=None):
+    """
+    Update the overlay label's text (and background color if provided).
+    """
+    global listening_label
+    if listening_label is not None:
+        listening_label.config(text=new_text)
+        if bg_color is not None:
+            listening_label.config(bg=bg_color)
 
 ################################################################################
 # 1) Keyboard Device Detection
@@ -209,7 +218,8 @@ def start_recording():
     stop_recording_flag = False
     audio_queue = queue.Queue()
 
-    # Show "listening..." overlay
+    # Show "Listening..." overlay
+    set_overlay_text("Listening...", bg_color="green")
     show_overlay()
 
     record_thread = threading.Thread(target=audio_recording_thread, args=(16000,))
@@ -233,8 +243,8 @@ def stop_recording_and_transcribe():
     if record_thread is not None:
         record_thread.join()
 
-    # Hide "listening..." overlay
-    hide_overlay()
+    # Switch overlay from "Listening..." to "Processing..."
+    set_overlay_text("Processing...", bg_color="orange")
 
     # Collect all audio from the queue
     print("[Main] Collecting audio data...")
@@ -244,6 +254,7 @@ def stop_recording_and_transcribe():
 
     if not recorded_chunks:
         print("[Main] No audio recorded.")
+        hide_overlay()
         return
 
     # Concatenate all chunks into one numpy array
@@ -253,6 +264,8 @@ def stop_recording_and_transcribe():
     print("[Main] Transcribing audio...")
     text_result = transcribe_audio(audio_data, sample_rate=16000)
     print(f"[Main] Transcription result: {text_result!r}")
+
+    hide_overlay()  # Done processing, now hide
 
     # Type the result
     simulate_typing(text_result)
@@ -275,7 +288,7 @@ def abort_recording():
     if record_thread is not None:
         record_thread.join()
 
-    # Hide "listening..." overlay
+    # Hide the overlay
     hide_overlay()
 
     # Discard any recorded audio
