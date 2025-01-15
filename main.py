@@ -306,7 +306,7 @@ def transcribe_audio(audio_data, sample_rate=16000):
         audio=audio_data_float32,
         language="en",
         word_timestamps=False,
-        beam_size=5,
+        beam_size=20,
     )
     transcription = "".join(segment.text for segment in segments).strip()
     return transcription
@@ -373,19 +373,22 @@ def keyboard_listener_loop(dev_path):
     Reads events from the keyboard device and:
       - Toggles start/stop recording when Left Ctrl + Right Ctrl are pressed.
       - Aborts any ongoing recording when Left Shift + Right Shift are pressed.
-      - If OSError: [Errno 19] No such device, go into inactive mode and wait for
-        a new keyboard. Once found, automatically resume listening on that new device.
     """
     global left_ctrl_pressed, right_ctrl_pressed
     global left_shift_pressed, right_shift_pressed
 
-    print(f"[Main] Listening on keyboard device: {dev_path}")
-    dev = InputDevice(dev_path)
-
-    print("[Main] Press Left Ctrl + Right Ctrl together to start/stop recording.")
-    print("[Main] Press Left Shift + Right Shift together to ABORT any recording.")
+    try:
+        dev = InputDevice(dev_path)
+        print(f"[Main] Listening on keyboard device: {dev_path}")
+        print("[Main] Press Left Ctrl + Right Ctrl together to start/stop recording.")
+        print("[Main] Press Left Shift + Right Shift together to ABORT any recording.")
+    except FileNotFoundError:
+        # Gracefully handle if device no longer exists
+        print(f"[Error] Keyboard device {dev_path} not found. Returning to neutral state.")
+        return
 
     try:
+        # Wrap the read_loop in a try/except to catch device removal mid-loop
         for event in dev.read_loop():
             if event.type == ecodes.EV_KEY:
                 key_event = categorize(event)
@@ -428,68 +431,52 @@ def keyboard_listener_loop(dev_path):
                     abort_recording()
 
     except OSError as e:
-        # Gracefully handle "No such device"
-        if e.errno == 19:
-            print("[Main] Device not found or disconnected. Inactive mode.")
-            print("[Main] Will automatically resume when a new keyboard is found.")
-            # Inactive mode: poll for a newly detected keyboard
-            while True:
-                time.sleep(1)
-                possible_new_device = find_keyboard_device()
-                if possible_new_device:
-                    print("[Main] Found a new keyboard. Resuming operation.")
-                    keyboard_listener_loop(possible_new_device)
-                    return  # Important to exit the old function scope
-        else:
-            # If it's some other OSError, re-raise
-            raise
+        # Commonly raised when the device disappears (e.g., unplugged)
+        print(f"[Error] Keyboard device {dev_path} disappeared: {e}")
+        # Return to neutral state
+        if is_recording:
+            # You can decide if you want to stop with transcription or abort
+            # Here we abort to discard partial audio
+            abort_recording()
 
     except KeyboardInterrupt:
         print("[Main] KeyboardInterrupt received. Exiting.")
+
     finally:
         # If still recording upon exit, stop gracefully (with transcription).
         if is_recording:
             stop_recording_and_transcribe()
-        print("[Main] Bye!")
+        print("[Main] Keyboard listener loop finished for device:", dev_path)
 
 ################################################################################
-# 7) Main Entry Point
+# 8) Main Entry Point - Modified
 ################################################################################
-
-def start_keyboard_thread():
-    """
-    Finds a keyboard device (or waits for one), then starts the keyboard listener loop.
-    This runs in a separate thread so the Tk mainloop remains free.
-    """
-    def _run():
-        dev_path = find_keyboard_device()
-        if not dev_path:
-            print("Could not find a keyboard-like device initially. Inactive mode.")
-            print("Reconnect your keyboard at any time; script will automatically resume.")
-            # Poll for a keyboard device
-            while True:
-                time.sleep(1)
-                possible_new_device = find_keyboard_device()
-                if possible_new_device:
-                    print("[Main] Found a device. Now listening.")
-                    keyboard_listener_loop(possible_new_device)
-                    break
-        else:
-            keyboard_listener_loop(dev_path)
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
 
 def main():
-    # 1) Initialize the Tkinter overlay
-    init_overlay()
+    """
+    Main loop:
+      1) Attempt to find a keyboard device.
+      2) If found, run keyboard_listener_loop(dev_path).
+      3) If not found or device is lost, handle gracefully and retry.
+    """
+    while True:
+        dev_path = find_keyboard_device()
+        if not dev_path:
+            print("[Warning] No suitable keyboard device found. Retrying in 5 seconds...")
+            time.sleep(5)
+            continue
 
-    # 2) Start keyboard listener in a background thread
-    start_keyboard_thread()
+        print(f"[Main] Found keyboard device at {dev_path}. Starting listener...")
+        keyboard_listener_loop(dev_path)
 
-    # 3) Run the Tkinter main loop in the main thread (blocking)
-    print("[Main] Entering Tk mainloop. Press Ctrl+C in the terminal to quit.")
-    root.mainloop()
+        # If we exit from keyboard_listener_loop (device lost or unplugged),
+        # wait before scanning for a new device again.
+        print("[Main] Will attempt to find keyboard again in 5 seconds.")
+        time.sleep(5)
+
+    # Optionally handle an external exit condition here, if desired
+    # (e.g., if you want to break the while loop on certain signals).
+    # We'll assume it's indefinite for this example.
 
 if __name__ == "__main__":
     main()
