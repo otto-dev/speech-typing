@@ -452,13 +452,8 @@ def keyboard_listener_loop(dev_path):
 # 8) Main Entry Point - Modified
 ################################################################################
 
+
 def main():
-    """
-    Main loop:
-      1) Attempt to find a keyboard device.
-      2) If found, run keyboard_listener_loop(dev_path).
-      3) If not found or device is lost, handle gracefully and retry.
-    """
     while True:
         dev_path = find_keyboard_device()
         if not dev_path:
@@ -468,15 +463,18 @@ def main():
 
         print(f"[Main] Found keyboard device at {dev_path}. Starting listener...")
         keyboard_listener_loop(dev_path)
-
-        # If we exit from keyboard_listener_loop (device lost or unplugged),
-        # wait before scanning for a new device again.
         print("[Main] Will attempt to find keyboard again in 5 seconds.")
         time.sleep(5)
 
-    # Optionally handle an external exit condition here, if desired
-    # (e.g., if you want to break the while loop on certain signals).
-    # We'll assume it's indefinite for this example.
+def run_tk():
+    init_overlay()
+    root.mainloop()
 
 if __name__ == "__main__":
+    # Start Tkinter in main thread (preferred):
+    # Or start Tkinter in a background thread:
+    tk_thread = threading.Thread(target=run_tk, daemon=True)
+    tk_thread.start()
+
+    # Then run our indefinite loop in this thread:
     main()
